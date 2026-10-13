@@ -1,0 +1,16 @@
+{
+  "name": "wananimate",
+  "repo": "romingodelfuego/fakinflu-wananimate-worker",
+  "visibility": "private",
+  "description": "fakinflu RunPod serverless worker: wananimate (Comfy-Org/Wan-Animate-2)",
+  "endpoint": {
+    "name": "romingodelfuego/fakinflu-wananimate-worker",
+    "env_var": "RUNPOD_WANANIMATE_ENDPOINT_ID",
+    "gpu_pools": ["AMPERE_24"],
+    "workers": {"min": 0, "max": 2, "idleTimeout": 5},
+    "timeout_ms": 600000,
+    "flashboot": "FLASHBOOT",
+    "disk_gb": 40,
+    "env": {}
+  }
+}
