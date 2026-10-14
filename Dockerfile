@@ -38,19 +38,12 @@ RUN if [ "${WITH_BF16}" = "1" ]; then MODELS_DIR=/comfyui/models bash /tmp/downl
 
 COPY fakinflu_nodes /comfyui/custom_nodes/fakinflu_nodes
 
-# Garde-fou API ComfyUI : echoue le BUILD (pas en prod sur GPU) si nos noeuds importent mal ou
-# utilisent une API comfy inexistante. C'est ce qui aurait attrape `comfy.model_management.
-# intermediate_dtype()` (n'existe pas) avant deploiement. Ajouter un assert par API comfy utilisee.
-RUN cd /comfyui && python3 -c "\
-import comfy.model_management as m, comfy.utils as u;\
-assert hasattr(m, 'intermediate_device'), 'comfy.model_management.intermediate_device absent';\
-assert hasattr(u, 'common_upscale'), 'comfy.utils.common_upscale absent';\
-import importlib.util as il;\
-s = il.spec_from_file_location('fakinflu_nodes', '/comfyui/custom_nodes/fakinflu_nodes/__init__.py');\
-mod = il.module_from_spec(s); s.loader.exec_module(mod);\
-need = {'FakinfluAnimatePrep', 'FakinfluSaveSegment', 'FakinfluConcatVideo'};\
-assert need <= set(mod.NODE_CLASS_MAPPINGS), 'noeuds fakinflu manquants';\
-print('fakinflu_nodes OK :', sorted(mod.NODE_CLASS_MAPPINGS))"
+# Garde-fou API ComfyUI, 100% STATIQUE (aucun import torch/comfy -> aucune init CUDA, donc OK sans GPU
+# au build). Echoue le BUILD si un noeud reference une API comfy.<module>.<attr> inexistante (ex.
+# `intermediate_dtype`) : le bug est attrape ici, pas sur un job GPU facture. NE PAS importer
+# comfy.model_management au build : son code de module appelle torch.cuda et casse sans driver.
+COPY check_comfy_api.py /tmp/check_comfy_api.py
+RUN python3 /tmp/check_comfy_api.py /comfyui/custom_nodes/fakinflu_nodes/__init__.py /comfyui/comfy
 
 # --- Handler fakinflu (remplace /handler.py de worker-comfyui) ---------------
 COPY transfer.py workflow.py VERSION* /fakinflu/
