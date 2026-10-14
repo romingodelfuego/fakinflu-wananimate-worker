@@ -67,7 +67,9 @@ class FakinfluAnimatePrep:
 
     def run(self, video_path, src_frames, src_fps, fps, width, height, mask_path=""):
         idx = frame_indices(src_frames, src_fps, fps)
-        dev, dt = comfy.model_management.intermediate_device(), comfy.model_management.intermediate_dtype()
+        # convention ComfyUI : les tenseurs IMAGE/MASK sont float32 [0,1] NHWC sur l'intermediate_device
+        # (il n'existe PAS de comfy.model_management.intermediate_dtype()).
+        dev, dt = comfy.model_management.intermediate_device(), torch.float32
         pose = torch.empty((len(idx), height, width, 3), dtype=dt, device=dev)
         pos = {src: k for k, src in enumerate(idx)}
         buf = []
