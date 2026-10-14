@@ -2,15 +2,29 @@
   "name": "wananimate",
   "repo": "romingodelfuego/fakinflu-wananimate-worker",
   "visibility": "private",
-  "description": "fakinflu RunPod serverless worker: wananimate (Comfy-Org/Wan-Animate-2)",
+  "description": "fakinflu RunPod serverless worker: Wan 2.2 Animate 14B character replacement (ComfyUI native WanAnimateToVideo, models baked). Inputs: control (pose) video + character mask from prep, character reference image, prompt. Output: animation.mp4.",
+  "license": "Wan 2.2 Animate weights (Comfy-Org/Wan-Animate-2): review upstream Wan 2.2 licence; umT5 / CLIP vision: Apache-2.0; lightx2v distill LoRA: Apache-2.0 — review before commercial use",
   "endpoint": {
-    "name": "romingodelfuego/fakinflu-wananimate-worker",
+    "name": "fakinflu-wananimate-worker",
     "env_var": "RUNPOD_WANANIMATE_ENDPOINT_ID",
-    "gpu_pools": ["AMPERE_24"],
-    "workers": {"min": 0, "max": 2, "idleTimeout": 5},
-    "timeout_ms": 600000,
+    "gpu_pools": [
+      "AMPERE_48",
+      "ADA_48_PRO"
+    ],
+    "workers": {
+      "min": 0,
+      "max": 2,
+      "idleTimeout": 5
+    },
+    "timeout_ms": 3600000,
     "flashboot": "FLASHBOOT",
-    "disk_gb": 40,
-    "env": {}
+    "disk_gb": 80,
+    "env": {
+      "WANANIMATE_JOB_TIMEOUT_S": "3500",
+      "COMFY_LOG_LEVEL": "INFO",
+      "COMFY_EXTRA_ARGS": "--disable-pinned-memory"
+    },
+    "notes": "Meme pool que scail (video Wan 14B). Serverless (catalogue RunPod 2026-10) : AMPERE_48 ~1,22 $/h, ADA_48_PRO ~1,75 $/h -> pire cas 1,75 $/h. Image : int8 ~17 Go + bf16 ~33 Go (choix par preset) + ~10 Go d'encodeurs. COMFY_EXTRA_ARGS modifiable sans rebuild.",
+    "price_per_h": 1.75
   }
 }

@@ -1,63 +1,328 @@
 #!/usr/bin/env python3
-"""fakinflu — worker RunPod : wananimate (Comfy-Org/Wan-Animate-2).
+"""fakinflu — worker wananimate : Wan 2.2 Animate (14B via ComfyUI). Route remplacement.
 
-Entree : {"items": [ {...}, ... ]}  (ou un item seul a plat dans "input")
-Sortie : {"results": [ {...} | {"error": "..."} ]}
+Remplace le /handler.py de runpod/worker-comfyui ; /start.sh lance ComfyUI (127.0.0.1:8188).
+Handler GENERATEUR : progression et apercu via /stream (return_aggregate_stream = False).
+Meme squelette que scail/serverless/handler.py (chaque worker est autonome).
 
-Plusieurs items par job = un seul cold start paye ; un item en echec ne fait
-pas echouer le lot. Le modele est charge UNE fois, au cold start.
+Entree (contrat transfer.py) :
+  {"run_id", "r2": bool,
+   "inputs":  {"control": video de controle du prep (control_video.mp4 : pose/depth/facemesh),
+               "ref":     photo du personnage (PNG/JPEG),
+               "mask":    option, masque video du personnage (mask.mp4, hors mode fast)},
+   "outputs": {"video": {put_url, key, max_bytes} | {max_bytes}},
+   "outputs_json": {put_url, key} | null,
+   "params":  {"preset": "draft|final", "resolution": int, "prompt": str, "negative": str,
+               "seed": int|null, "precision": "int8|bf16"?, "probe": bool?}}
 """
-import base64, io, os, time, traceback
-
-os.environ.setdefault("HF_HUB_OFFLINE", "1")  # poids bakes : jamais de telechargement au runtime
+import glob, json, os, queue, re, shutil, subprocess, tempfile, threading, time, traceback, urllib.error, urllib.request, uuid
 
 import runpod
-import torch
-from PIL import Image
 
-MODEL_ID = os.environ.get("MODEL_ID", "Comfy-Org/Wan-Animate-2")
+from transfer import Outputs, fetch_inputs, preview_event, version_event
+from workflow import build_workflow, plan, ram_bytes, OUTPUT_FILES, OUTPUT_NAMES
 
-# --- chargement unique au cold start ------------------------------------------
-# TODO : charger le modele, ex. _model = Pipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float16).to("cuda")
-_model = None
-
-
-def _b64_to_image(b64: str) -> Image.Image:
-    if b64.strip().startswith("data:") and "," in b64[:64]:
-        b64 = b64.split(",", 1)[1]
-    return Image.open(io.BytesIO(base64.b64decode(b64)))
+COMFY = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
+COMFY_DIR = os.environ.get("COMFY_DIR", "/comfyui")
+JOB_TIMEOUT = int(os.environ.get("WANANIMATE_JOB_TIMEOUT_S", "3500"))
+IMAGES_RAM_SHARE = float(os.environ.get("WANANIMATE_IMAGES_RAM_SHARE", "0.30"))
+IMAGES_RAM_FALLBACK_GB = float(os.environ.get("WANANIMATE_IMAGES_RAM_GB", "12"))
+BF16_MIN_VRAM_GB = float(os.environ.get("WANANIMATE_BF16_MIN_VRAM_GB", "40"))
 
 
-def _image_to_b64(img: Image.Image, fmt: str = "PNG") -> str:
-    buf = io.BytesIO()
-    img.save(buf, format=fmt)
-    return base64.b64encode(buf.getvalue()).decode()
+def _http(method, path, payload=None, timeout=30):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(COMFY + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"} if data else {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode() or "{}")
 
 
-def _process(item: dict) -> dict:
-    """TODO : une inference. Valider les champs, renvoyer un dict serialisable."""
+def wait_comfy(max_s=600):
     t = time.time()
-    # ex. image = _b64_to_image(item["image"]); out = _model(image=image, prompt=item.get("prompt", ""))
-    return {"echo": {k: v for k, v in item.items() if k != "image"},
-            "stats": {"seconds": round(time.time() - t, 2)}}
+    while time.time() - t < max_s:
+        try:
+            _http("GET", "/system_stats", timeout=5)
+            return
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
+            time.sleep(1)
+    raise RuntimeError(f"ComfyUI injoignable sur {COMFY} apres {max_s}s")
+
+
+def _ws_progress(client_id, q, stop):
+    try:
+        import websocket
+    except ImportError:
+        return
+    url = COMFY.replace("http", "ws", 1) + f"/ws?clientId={client_id}"
+    try:
+        ws = websocket.create_connection(url, timeout=5)
+    except Exception:
+        return
+    ws.settimeout(1)
+    while not stop.is_set():
+        try:
+            msg = ws.recv()
+        except Exception:
+            continue
+        if not isinstance(msg, str):
+            continue
+        try:
+            m = json.loads(msg)
+        except ValueError:
+            continue
+        if m.get("type") in ("progress", "executing"):
+            q.put(m)
+    ws.close()
+
+
+def run_workflow(wf):
+    """Generateur : soumet le graphe, emet la progression, renvoie (secondes) via StopIteration."""
+    client_id = uuid.uuid4().hex
+    q, stop = queue.Queue(), threading.Event()
+    th = threading.Thread(target=_ws_progress, args=(client_id, q, stop), daemon=True)
+    th.start()
+    try:
+        try:
+            r = _http("POST", "/prompt", {"prompt": wf, "client_id": client_id})
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"ComfyUI a refuse le graphe (HTTP {e.code}) : {e.read().decode()[:1500]}")
+        pid = r["prompt_id"]
+        t0, last_poll = time.time(), 0.0
+        names = {k: v.get("_meta", {}).get("title") or v["class_type"] for k, v in wf.items()}
+        while True:
+            if time.time() - t0 > JOB_TIMEOUT:
+                _http("POST", "/interrupt", {})
+                raise RuntimeError(f"timeout ComfyUI ({JOB_TIMEOUT}s)")
+            try:
+                m = q.get(timeout=1)
+                d = m.get("data", {})
+                if m["type"] == "executing" and d.get("node"):
+                    yield {"type": "progress", "step": names.get(d["node"], d["node"])}
+                elif m["type"] == "progress" and d.get("max"):
+                    yield {"type": "progress", "step": names.get(d.get("node"), "calcul"),
+                           "pct": round(100 * d["value"] / d["max"]), "frame": d["value"]}
+            except queue.Empty:
+                pass
+            if time.time() - last_poll < 2:
+                continue
+            last_poll = time.time()
+            try:
+                h = _http("GET", f"/history/{pid}")
+            except urllib.error.HTTPError:
+                raise
+            except urllib.error.URLError as e:
+                raise RuntimeError(f"ComfyUI s'est arrete en cours de calcul ({e.reason}) : {oom_report()}") from e
+            if pid not in h:
+                continue
+            st = h[pid].get("status") or {}
+            if st.get("status_str") == "error":
+                msgs = [m for m in st.get("messages", []) if m and m[0] == "execution_error"]
+                detail = msgs[-1][1] if msgs else st
+                if isinstance(detail, dict):
+                    detail = {k: detail.get(k) for k in ("node_id", "node_type", "exception_message")}
+                raise RuntimeError(f"erreur d'execution ComfyUI : {json.dumps(detail, ensure_ascii=False)[:800]}")
+            if st.get("completed"):
+                return time.time() - t0
+    finally:
+        stop.set()
+
+
+def collect(prefix):
+    base = os.path.join(COMFY_DIR, "output", prefix)
+    found = {}
+    for role, pattern in OUTPUT_FILES.items():
+        hits = sorted(glob.glob(os.path.join(base, pattern)))
+        if hits:
+            found[role] = hits[-1]
+    return found
+
+
+def ffprobe(path):
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+                          "-show_entries", "stream=width,height,r_frame_rate,nb_read_packets",
+                          "-of", "json", path], capture_output=True, text=True, timeout=120)
+    s = json.loads(out.stdout)["streams"][0]
+    num, den = s["r_frame_rate"].split("/")
+    return {"width": int(s["width"]), "height": int(s["height"]),
+            "fps": float(num) / float(den or 1), "frames": int(s.get("nb_read_packets") or 0)}
+
+
+def thumb(video, t=1.0):
+    dst = video + ".jpg"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(t), "-i", video, "-frames:v", "1",
+                    "-vf", "scale=480:-2", "-q:v", "5", dst], timeout=60, check=True)
+    with open(dst, "rb") as f:
+        return f.read()
+
+
+def memory_limit_bytes():
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path) as f:
+                v = f.read().strip()
+        except OSError:
+            continue
+        if v.isdigit() and int(v) < 1 << 60:
+            return int(v)
+    return None
+
+
+def _cgroup(name):
+    for base in ("/sys/fs/cgroup", "/sys/fs/cgroup/memory"):
+        try:
+            with open(os.path.join(base, name)) as f:
+                return f.read()
+        except OSError:
+            continue
+    return None
+
+
+def oom_report():
+    events = _cgroup("memory.events") or ""
+    kills = next((int(l.split()[1]) for l in events.splitlines() if l.startswith("oom_kill ")), None)
+    peak = _cgroup("memory.peak") or _cgroup("memory.max_usage_in_bytes")
+    limit = memory_limit_bytes()
+    gb = lambda b: f"{int(b) / 1024 ** 3:.1f} Go"
+    mem = f"pic {gb(peak.strip())}" if peak and peak.strip().isdigit() else "pic inconnu"
+    mem += f", limite {gb(limit)}" if limit else ", limite inconnue"
+    if kills:
+        return (f"tue par le noyau faute de memoire (oom_kill={kills}, {mem}). Verifier COMFY_EXTRA_ARGS "
+                f"(actuel : {os.environ.get('COMFY_EXTRA_ARGS', '')!r}), sinon resolution plus basse")
+    return f"aucun oom_kill dans le cgroup ({mem}) : plantage natif probable (journaux RunPod du worker)"
+
+
+def _gb(b):
+    return round(int(b) / 1024 ** 3, 2) if b not in (None, "") and str(b).strip().isdigit() else None
+
+
+def probe_report():
+    stats = {}
+    try:
+        stats = _http("GET", "/system_stats", timeout=10)
+    except Exception as e:
+        stats = {"error": f"{type(e).__name__}: {e}"}
+    disk = {}
+    for path in ("/", COMFY_DIR):
+        try:
+            st = os.statvfs(path)
+            disk[path] = {"free_gb": round(st.f_bavail * st.f_frsize / 1024 ** 3, 2), "total_gb": round(st.f_blocks * st.f_frsize / 1024 ** 3, 2)}
+        except OSError:
+            pass
+    system = stats.get("system") or {}
+    return {
+        "cgroup": {"limit_gb": _gb(memory_limit_bytes()), "peak_gb": _gb((_cgroup("memory.peak") or "").strip())},
+        "comfyui": {"version": system.get("comfyui_version"), "pytorch": system.get("pytorch_version"),
+                    "argv": system.get("argv"), "ram_total_gb": _gb(system.get("ram_total")),
+                    "devices": [{k: d.get(k) for k in ("name", "type", "vram_total", "vram_free")} for d in stats.get("devices") or []],
+                    "error": stats.get("error")},
+        "disk": disk,
+        "env": {"COMFY_EXTRA_ARGS": os.environ.get("COMFY_EXTRA_ARGS", "")},
+    }
+
+
+def check_vram(precision):
+    try:
+        devices = _http("GET", "/system_stats", timeout=10).get("devices") or []
+    except Exception:
+        return None
+    vram = max((d.get("vram_total") or 0 for d in devices), default=0) / 1024 ** 3
+    if precision == "bf16" and 0 < vram < BF16_MIN_VRAM_GB:
+        raise ValueError(f"precision bf16 sur {vram:.0f} Go de VRAM : il en faut {BF16_MIN_VRAM_GB:g} ; utiliser int8")
+    return f"VRAM {vram:.0f} Go, precision {precision}"
+
+
+def check_memory(summary):
+    need = ram_bytes(summary)
+    limit = memory_limit_bytes()
+    budget = IMAGES_RAM_SHARE * limit if limit else IMAGES_RAM_FALLBACK_GB * 1024 ** 3
+    gb = lambda b: f"{b / 1024 ** 3:.1f} Go"
+    info = f"images en RAM {gb(need)}, limite conteneur {gb(limit) if limit else 'inconnue'}, budget {gb(budget)}"
+    if need > budget:
+        raise ValueError(f"generation trop lourde pour le worker ({info}) : baisser resolution/fps ou max_length")
+    return info
+
+
+def _to_input(path, tag):
+    """Copie une entree dans input/ de ComfyUI (LoadImage n'y lit que la)."""
+    name = f"{tag}_{os.path.basename(path)}"
+    shutil.copy(path, os.path.join(COMFY_DIR, "input", name))
+    return name
 
 
 def handler(job):
-    inp = job.get("input", {}) or {}
-    items = inp.get("items") or [inp]
-    results = []
-    for item in items:
-        res = {"id": item.get("id")}
+    inp = job.get("input") or {}
+    params = inp.get("params") or {}
+    prompt, negative = (params.get("prompt") or "").strip(), (params.get("negative") or "").strip()
+    precision = params.get("precision") or "int8"
+    work = tempfile.mkdtemp(prefix="wananimate_")
+    copied = []
+    tag = uuid.uuid4().hex[:8]
+    prefix = f"fakinflu/{inp.get('run_id') or job.get('id', 'run')}"
+    t0 = time.time()
+    yield version_event("wananimate")
+    if params.get("probe"):
         try:
-            res.update(_process(item))
+            outputs = Outputs(inp)
+            wait_comfy(120)
+            report = probe_report()
+            print(f"[wananimate] sonde : {json.dumps(report)}", flush=True)
+            path = os.path.join(work, "probe.json")
+            with open(path, "w") as f:
+                json.dump(report, f, indent=2)
+            yield from outputs.emit("probe", path, "probe.json")
+            yield {"type": "done", "seed": None, "timings": {"total_s": round(time.time() - t0, 1)}}
         except Exception as e:
             traceback.print_exc()
-            res["error"] = f"{type(e).__name__}: {e}"
+            yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
         finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        results.append(res)
-    return {"results": results}
+            shutil.rmtree(work, ignore_errors=True)
+        return
+    try:
+        outputs = Outputs(inp)
+        paths, events = fetch_inputs(inp, os.path.join(work, "in"), outputs)
+        yield from events
+        missing = [r for r in ("control", "ref") if r not in paths]
+        if missing:
+            raise ValueError(f"entrees manquantes : {missing}")
+        meta = ffprobe(paths["control"])
+        summary = plan(params, meta)
+        mem_info = check_memory(summary)
+        print(f"[wananimate] {mem_info} ; COMFY_EXTRA_ARGS={os.environ.get('COMFY_EXTRA_ARGS', '')!r}", flush=True)
+        yield {"type": "progress", "step": mem_info, "pct": 1}
+        yield {"type": "progress", "pct": 2,
+               "step": f"controle {meta['width']}x{meta['height']} {meta['fps']:.2f} fps, {meta['frames']} images -> "
+                       f"{summary['width']}x{summary['height']} a {summary['fps']:g} fps, {summary['frames_out']} images"}
+
+        files = {"control": paths["control"], "ref": _to_input(paths["ref"], tag)}
+        if "mask" in paths:
+            files["mask"] = paths["mask"]
+        copied = [os.path.join(COMFY_DIR, "input", files["ref"])]
+        wait_comfy()
+        vram_info = check_vram(precision)
+        if vram_info:
+            yield {"type": "progress", "step": vram_info, "pct": 3}
+        wf = build_workflow(params, prompt, negative, files, prefix, meta)
+        seconds = yield from run_workflow(wf)
+
+        produced = collect(prefix)
+        if "video" not in produced:
+            raise RuntimeError(f"aucune video produite (fichiers : {sorted(produced)})")
+        yield preview_event(thumb(produced["video"]), "image/jpeg")
+        yield from outputs.emit("video", produced["video"], OUTPUT_NAMES["video"])
+        outputs.write_summary()
+        yield {"type": "done", "seed": params.get("seed"),
+               "timings": {"comfy_s": round(seconds, 1), "total_s": round(time.time() - t0, 1), "frames_out": summary["frames_out"]}}
+    except Exception as e:
+        traceback.print_exc()
+        yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(os.path.join(COMFY_DIR, "output", prefix), ignore_errors=True)
+        for p in copied:
+            if os.path.exists(p):
+                os.remove(p)
 
 
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler, "return_aggregate_stream": False})

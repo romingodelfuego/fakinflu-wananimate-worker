@@ -1,1 +1,10 @@
-{"input": {"items": [{"id": "smoke", "prompt": "hello"}]}}
+{
+  "input": {
+    "run_id": "smoke-probe",
+    "r2": false,
+    "inputs": {},
+    "outputs": { "probe": { "max_bytes": 262144 } },
+    "outputs_json": null,
+    "params": { "probe": true }
+  }
+}
