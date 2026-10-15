@@ -5,10 +5,13 @@
 # version de ComfyUI qui a introduit Wan 2.2 Animate. Le worker construit son graphe lui-meme
 # (workflow.py) ; seul ajout : fakinflu_nodes (chargement de la video de controle + encodage par morceau).
 #
-# IMPORTANT : WORKER_TAG doit pointer un tag `-base` dont le ComfyUI embarque WanAnimateToVideo.
-# Le garde-fou ci-dessous ECHOUE le build si ce n'est pas le cas (choisir un tag plus recent). On part
-# sur `latest-base` par defaut (premier build) ; EPINGLER un tag precis ensuite pour la reproductibilite.
-ARG WORKER_TAG=latest-base
+# IMPORTANT : WORKER_TAG doit pointer un tag `-base` dont le ComfyUI (a) embarque WanAnimateToVideo ET
+# (b) sait DETECTER le checkpoint Wan Animate 2 int8 'convrot' (model_type animate2, in_dim 36). Le
+# `latest-base` initial livrait ComfyUI 0.17.2 : le noeud existait mais model_config_from_unet faisait
+# "no match" sur l'unet int8 -> crash quant_config=None au 1er job. On epingle 5.10.0-base = ComfyUI
+# 0.34.0 (comme scail, qui fait tourner Wan 2.1). Les deux garde-fous ci-dessous echouent le BUILD si
+# 0.34.0 n'a pas le noeud -> on le sait sans gaspiller un job GPU.
+ARG WORKER_TAG=5.10.0-base
 FROM runpod/worker-comfyui:${WORKER_TAG}
 
 # Garde-fou de parite de version : echoue ICI si ComfyUI n'a pas le noeud attendu.
