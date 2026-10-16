@@ -139,16 +139,19 @@ class FakinfluSaveSegment:
             "index": ("INT", {"default": 0, "min": 0, "max": 1000}),
             "skip": ("INT", {"default": 0, "min": 0, "max": 1000, "tooltip": "images de recouvrement a retirer en tete"}),
             "fps": ("FLOAT", {"default": 16.0, "min": 1.0, "max": 240.0}),
-        }, "optional": {"previous": ("STRING", {"forceInput": True})}}
+        }, "optional": {"previous": ("STRING", {"forceInput": True}),
+                        "limit": ("INT", {"default": 0, "min": 0, "max": 100000,
+                                          "tooltip": "images a garder apres `skip` (0 = toutes) ; cale la derniere passe sur la duree reelle"})}}
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("segments",)
     FUNCTION = "run"
     CATEGORY = "fakinflu"
 
-    def run(self, images, filename_prefix, index, skip, fps, previous=None):
+    def run(self, images, filename_prefix, index, skip, fps, previous=None, limit=0):
         path = os.path.join(_out_dir(filename_prefix), f"segment_{index:03d}.mp4")
-        encode(images[skip:], path, fps)
+        kept = images[skip:skip + limit] if limit else images[skip:]
+        encode(kept, path, fps)
         return ("\n".join([p for p in (previous or "").split("\n") if p] + [path]),)
 
 

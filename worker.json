@@ -27,5 +27,5 @@
     "notes": "Meme pool que scail (video Wan 14B). Serverless (catalogue RunPod 2026-10) : AMPERE_48 ~1,22 $/h, ADA_48_PRO ~1,75 $/h -> pire cas 1,75 $/h. Image : int8 ~17 Go + bf16 ~33 Go (choix par preset) + ~10 Go d'encodeurs. COMFY_EXTRA_ARGS modifiable sans rebuild.",
     "price_per_h": 1.75
   },
-  "version": "v1.0.3"
+  "version": "v1.1.0"
 }
