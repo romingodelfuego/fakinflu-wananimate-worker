@@ -5,22 +5,27 @@ Remplace le /handler.py de runpod/worker-comfyui ; /start.sh lance ComfyUI (127.
 Handler GENERATEUR : progression et apercu via /stream (return_aggregate_stream = False).
 Meme squelette que scail/serverless/handler.py (chaque worker est autonome).
 
-Entree (contrat transfer.py) :
+Entree (contrat transfer.py, contracts/wananimate.input.schema.json) :
   {"run_id", "r2": bool,
-   "inputs":  {"control": video de controle du prep (control_video.mp4 : pose/depth/facemesh),
-               "ref":     photo du personnage (PNG/JPEG),
-               "mask":    option, masque video du personnage (mask.mp4, hors mode fast)},
+   "inputs":  signal control (defaut) :
+                {"control": video de controle du prep (control_video.mp4 : pose/depth/facemesh),
+                 "mask":    option, masque video du personnage (mask.mp4, hors mode fast)}
+              signal pose (v1.2.0) :
+                {"source":  video d'origine (prep/input.mp4) -> squelette DWPose + decor d'origine,
+                 "mask":    masque video du personnage (prep/mask.mp4), obligatoire}
+              + toujours {"ref": photo du personnage (PNG/JPEG)},
    "outputs": {"video": {put_url, key, max_bytes} | {max_bytes}},
    "outputs_json": {put_url, key} | null,
    "params":  {"preset": "draft|final", "resolution": int, "prompt": str, "negative": str,
-               "seed": int|null, "precision": "int8|bf16"?, "probe": bool?}}
+               "seed": int|null, "precision": "int8|bf16"?, "signal": "control|pose"?,
+               "mask_expand": int?, "fps": number?, "max_length": int?, "probe": bool?}}
 """
 import glob, json, os, queue, re, shutil, subprocess, tempfile, threading, time, traceback, urllib.error, urllib.request, uuid
 
 import runpod
 
 from transfer import Outputs, fetch_inputs, preview_event, version_event
-from workflow import build_workflow, plan, ram_bytes, OUTPUT_FILES, OUTPUT_NAMES
+from workflow import build_workflow, plan, ram_bytes, required_inputs, signal_of, OUTPUT_FILES, OUTPUT_NAMES
 
 COMFY = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
 COMFY_DIR = os.environ.get("COMFY_DIR", "/comfyui")
@@ -279,22 +284,29 @@ def handler(job):
             shutil.rmtree(work, ignore_errors=True)
         return
     try:
+        # Signal et roles verifies AVANT tout telechargement ou calcul GPU.
+        signal = signal_of(params)
+        roles = required_inputs(params)
+        missing = [r for r in roles if r not in (inp.get("inputs") or {})]
+        if missing:
+            raise ValueError(f"missing inputs for signal {signal}: {missing}")
         outputs = Outputs(inp)
         paths, events = fetch_inputs(inp, os.path.join(work, "in"), outputs)
         yield from events
-        missing = [r for r in ("control", "ref") if r not in paths]
+        missing = [r for r in roles if r not in paths]
         if missing:
-            raise ValueError(f"missing inputs: {missing}")
-        meta = ffprobe(paths["control"])
+            raise ValueError(f"missing inputs for signal {signal}: {missing}")
+        video = "source" if signal == "pose" else "control"
+        meta = ffprobe(paths[video])
         summary = plan(params, meta)
         mem_info = check_memory(summary)
         print(f"[wananimate] {mem_info} ; COMFY_EXTRA_ARGS={os.environ.get('COMFY_EXTRA_ARGS', '')!r}", flush=True)
         yield {"type": "progress", "step": mem_info, "pct": 1}
         yield {"type": "progress", "pct": 2,
-               "step": f"control {meta['width']}x{meta['height']} {meta['fps']:.2f} fps, {meta['frames']} frames -> "
+               "step": f"{video} {meta['width']}x{meta['height']} {meta['fps']:.2f} fps, {meta['frames']} frames -> "
                        f"{summary['width']}x{summary['height']} at {summary['fps']:g} fps, {summary['frames_out']} frames"}
 
-        files = {"control": paths["control"], "ref": _to_input(paths["ref"], tag)}
+        files = {video: paths[video], "ref": _to_input(paths["ref"], tag)}
         if "mask" in paths:
             files["mask"] = paths["mask"]
         copied = [os.path.join(COMFY_DIR, "input", files["ref"])]
@@ -311,7 +323,7 @@ def handler(job):
         yield preview_event(thumb(produced["video"]), "image/jpeg")
         yield from outputs.emit("video", produced["video"], OUTPUT_NAMES["video"])
         outputs.write_summary()
-        yield {"type": "done", "seed": params.get("seed"),
+        yield {"type": "done", "seed": params.get("seed"), "signal": signal,
                "timings": {"comfy_s": round(seconds, 1), "total_s": round(time.time() - t0, 1), "frames_out": summary["frames_out"]}}
     except Exception as e:
         traceback.print_exc()

@@ -50,5 +50,12 @@ case "${1:-}" in
   bf16)
     DL Comfy-Org/Wan-Animate-2 "$WA" diffusion_models/wan_animate_2_bf16.safetensors diffusion_models \
        642e906c7deaa27072a90ea433319b18f274da438ba75e350373467a0421f177 ;;
-  *) echo "usage: $0 core|int8|bf16" >&2; exit 2 ;;
+  dwpose)
+    # signal pose : MODELS_DIR = <comfyui_controlnet_aux>/ckpts, sous-dossier = depot HF (custom_hf_download).
+    # sha256 = oid LFS lu via l'API HF le 2026-10-22. Licence des deux depots : apache-2.0 (cartes HF).
+    DL hr16/yolox-onnx a124b32c3b7c5cebda1c7cd96178f0f9d2050125 yolox_l.torchscript.pt hr16/yolox-onnx \
+       80bc14b13c260c24b3014cd42c02994bf52296ab8fa2d80a60b6afe08c93ef42
+    DL hr16/DWPose-TorchScript-BatchSize5 359d662a9b33b73f6d0f21732baf8845f17bb4be dw-ll_ucoco_384_bs5.torchscript.pt \
+       hr16/DWPose-TorchScript-BatchSize5 d86a0b2b59fddc0901a7076e9f59c9f8602602133ed72511c693fd11eea23d91 ;;
+  *) echo "usage: $0 core|int8|bf16|dwpose" >&2; exit 2 ;;
 esac
