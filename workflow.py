@@ -16,6 +16,14 @@ son video_frame_offset : WanAnimateToVideo rembobine de OVERLAP et lit pose/masq
 (fenetre glissante), le recouvrement etant retire via trim_image. Voir build_workflow / segments().
 Le pic de RAM est borne par passe (ram_bytes), pas par la duree ; la limite restante est la VRAM
 (fenetre) et JOB_TIMEOUT x nombre de passes (baisser fps si trop de passes).
+
+Deux signaux (params.signal) :
+  control (defaut, v1.1.0) : pose_video = video de controle du prep (profondeur + facemesh) ; decor regenere.
+  pose (v1.2.0, repris d'Openjutsu, SydFloyd, Apache-2.0, commit f783a001) : mode REMPLACEMENT natif.
+    source.mp4 + mask.mp4 -> FakinfluAnimatePrep -> (images source, masque)
+    images source -> DWPreprocessor -> pose_video (squelette DWPose, ce sur quoi Wan Animate est entraine)
+    masque -> ThresholdMask -> GrowMask(mask_expand) -> character_mask
+    images source, zone du masque remplie de gris 127 -> background_video (decor d'origine garde)
 """
 import json, os, sys
 
@@ -29,6 +37,25 @@ CLIP_VISION = "clip_vision_h.safetensors"
 VAE = "Wan2_1_VAE_bf16.safetensors"
 
 DEFAULT_MAX_LENGTH = 77  # images par passe (v1 sans decoupage) ; relever avec la VRAM
+SIGNALS = ("control", "pose")
+DEFAULT_MASK_EXPAND = 12  # pixels ajoutes autour du masque en signal pose (GrowMask)
+GREY = 8355711  # 0x7F7F7F : remplissage de la zone du personnage dans background_video (Openjutsu)
+# Reglages DWPose repris tels quels d'Openjutsu (workflows/recast_wan22_animate.json).
+DWPOSE = {"detect_hand": "enable", "detect_body": "enable", "detect_face": "disable", "resolution": 512,
+          "bbox_detector": "yolox_l.torchscript.pt", "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt",
+          "scale_stick_for_xinsr_cn": "disable"}
+
+
+def signal_of(params):
+    sig = (params or {}).get("signal") or "control"
+    if sig not in SIGNALS:
+        raise ValueError(f"signal inconnu : {sig} ({'/'.join(SIGNALS)})")
+    return sig
+
+
+def required_inputs(params):
+    """Roles d'entree requis selon le signal (ref toujours)."""
+    return ["source", "mask", "ref"] if signal_of(params) == "pose" else ["control", "ref"]
 
 
 def frame_indices(n_src, src_fps, fps):
@@ -73,10 +100,13 @@ def segments(n, window, overlap=OVERLAP):
 
 
 def build_workflow(params, prompt, negative, files, prefix, meta):
-    """params : {preset, resolution, prompt, negative, seed, precision?, distill?, steps?, cfg?, shift?, fps?, max_length?}.
-    files : chemins absolus {control, mask?} (lus par FakinfluAnimatePrep) et nom dans input/ {ref}.
-    meta : {width, height, fps, frames} de la video de controle."""
+    """params : {preset, resolution, prompt, negative, seed, precision?, distill?, steps?, cfg?, shift?, fps?,
+    max_length?, signal?, mask_expand?}.
+    files : chemins absolus {control, mask?} (signal control) ou {source, mask} (signal pose), lus par
+    FakinfluAnimatePrep, et nom dans input/ {ref}.
+    meta : {width, height, fps, frames} de la video lue (control ou source)."""
     p = params or {}
+    signal = signal_of(p)
     precision = p.get("precision", "int8")
     if precision not in UNET_FILES:
         raise ValueError(f"precision inconnue : {precision} ({'/'.join(UNET_FILES)})")
@@ -95,9 +125,11 @@ def build_workflow(params, prompt, negative, files, prefix, meta):
     N, limits = segments(n, window)
 
     # Noeuds partages par toutes les passes : prep (pose + masque decodes une fois), modeles, prompts.
+    pose = signal == "pose"
     wf = {
-        "prep": {"class_type": "FakinfluAnimatePrep", "_meta": {"title": "video de controle + masque"},
-                 "inputs": {"video_path": files["control"], "mask_path": files.get("mask", ""),
+        "prep": {"class_type": "FakinfluAnimatePrep",
+                 "_meta": {"title": "video source + masque" if pose else "video de controle + masque"},
+                 "inputs": {"video_path": files["source" if pose else "control"], "mask_path": files.get("mask", ""),
                             "src_frames": int(meta["frames"]), "src_fps": float(meta["fps"]),
                             "fps": fps, "width": width, "height": height}},
         "ref": {"class_type": "LoadImage", "_meta": {"title": "photo du personnage"}, "inputs": {"image": files["ref"]}},
@@ -113,6 +145,23 @@ def build_workflow(params, prompt, negative, files, prefix, meta):
         "neg": {"class_type": "CLIPTextEncode", "_meta": {"title": "prompt negatif"}, "inputs": {"clip": ["clip", 0], "text": negative or ""}},
         "sampler": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
     }
+    # Entrees de WanAnimateToVideo selon le signal. pose : squelette DWPose + decor d'origine (zone du
+    # personnage en gris) + masque binarise (il sort d'un MP4 avec pertes) puis elargi.
+    if pose:
+        wf["dwpose"] = {"class_type": "DWPreprocessor", "_meta": {"title": "squelette DWPose"},
+                        "inputs": {"image": ["prep", 0], **DWPOSE}}
+        wf["mask_thr"] = {"class_type": "ThresholdMask", "inputs": {"mask": ["prep", 1], "value": 0.5}}
+        wf["mask_grow"] = {"class_type": "GrowMask", "_meta": {"title": "masque elargi"},
+                           "inputs": {"mask": ["mask_thr", 0], "expand": int(p.get("mask_expand", DEFAULT_MASK_EXPAND)),
+                                      "tapered_corners": True}}
+        wf["grey"] = {"class_type": "EmptyImage", "inputs": {"width": width, "height": height, "batch_size": 1, "color": GREY}}
+        wf["background"] = {"class_type": "ImageCompositeMasked", "_meta": {"title": "decor d'origine"},
+                            "inputs": {"destination": ["prep", 0], "source": ["grey", 0], "x": 0, "y": 0,
+                                       "resize_source": True, "mask": ["mask_grow", 0]}}
+        video_in = {"pose_video": ["dwpose", 0], "background_video": ["background", 0], "character_mask": ["mask_grow", 0]}
+    else:
+        video_in = {"pose_video": ["prep", 0], "character_mask": ["prep", 1]}
+
     model = ["unet", 0]
     if distill:
         wf["distill"] = {"class_type": "LoraLoaderModelOnly",
@@ -131,8 +180,7 @@ def build_workflow(params, prompt, negative, files, prefix, meta):
                    "width": width, "height": height, "length": window, "batch_size": 1,
                    "continue_motion_max_frames": OVERLAP,
                    "video_frame_offset": 0 if k == 0 else [f"cond{k - 1}", 5],
-                   "clip_vision_output": ["clip_vision_enc", 0], "reference_image": ["ref", 0],
-                   "pose_video": ["prep", 0], "character_mask": ["prep", 1]}
+                   "clip_vision_output": ["clip_vision_enc", 0], "reference_image": ["ref", 0], **video_in}
         if k > 0:
             cond_in["continue_motion"] = [f"dec{k - 1}", 0]
         wf[cond] = {"class_type": "WanAnimateToVideo", "_meta": {"title": f"Wan 2.2 Animate ({k + 1}/{N})"}, "inputs": cond_in}
@@ -167,23 +215,31 @@ def plan(params, meta):
     w, h = size_for(meta["width"], meta["height"], int(p.get("resolution", 480)))
     window = _length(p, n)
     N = segments(n, window)[0] if window > OVERLAP else 1
-    return {"width": w, "height": h, "fps": fps, "frames_in": n, "window": window, "segments": N, "frames_out": n}
+    return {"width": w, "height": h, "fps": fps, "frames_in": n, "window": window, "segments": N, "frames_out": n,
+            "signal": signal_of(p)}
 
 
 def ram_bytes(plan_):
     """Pic de RAM des IMAGE gardees par ComfyUI (float32), borne par PASSE et non par la duree totale :
     pose + masque decodes une fois (frames_in) + ~2 fenetres decodees vivantes (passe courante +
-    continue_motion de la precedente). Ne depend donc PAS du nombre de passes."""
+    continue_motion de la precedente). Ne depend donc PAS du nombre de passes.
+    Signal pose : images source + squelette + decor + masque (4 x frames_in) au lieu de pose + masque."""
     per_frame = plan_["width"] * plan_["height"] * 3 * 4
-    return per_frame * (2 * plan_["frames_in"] + 2 * plan_.get("window", plan_["frames_out"]))
+    held = 4 if plan_.get("signal") == "pose" else 2
+    return per_frame * (held * plan_["frames_in"] + 2 * plan_.get("window", plan_["frames_out"]))
 
 
-def _validate(url, control_path, ref_name):
+def _validate(url, signal, paths):
     """Soumet le graphe a un ComfyUI (local, 0 credit) : il le valide avant toute execution.
-    ref_name doit exister dans input/ ; modeles en fichiers vides."""
+    paths : [control, ref] (signal control) ou [source, mask, ref] (signal pose).
+    ref (dernier) doit exister dans input/ ; modeles en fichiers vides."""
     import urllib.error, urllib.request
     meta = {"width": 480, "height": 832, "fps": 30.0, "frames": 120}
-    wf = build_workflow({"resolution": 480}, "validation", "", {"control": control_path, "ref": ref_name}, "fakinflu/validate", meta)
+    params = {"resolution": 480, "signal": signal, "fps": 16}
+    roles = required_inputs(params)
+    if len(paths) != len(roles):
+        sys.exit(f"--validate --signal {signal} attend : {' '.join(roles)}")
+    wf = build_workflow(params, "validation", "", dict(zip(roles, paths)), "fakinflu/validate", meta)
     post = lambda path, body: urllib.request.urlopen(urllib.request.Request(
         url + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}), timeout=30)
     try:
@@ -193,22 +249,39 @@ def _validate(url, control_path, ref_name):
         sys.exit(1)
     post("/queue", {"clear": True}).close()
     post("/interrupt", {}).close()
-    print(f"OK : graphe accepte par ComfyUI ({len(wf)} noeuds), prompt_id={r.get('prompt_id')}")
+    print(f"OK : graphe {signal} accepte par ComfyUI ({len(wf)} noeuds), prompt_id={r.get('prompt_id')}")
 
 
 # Meta representative pour un dump « template » (valeurs lisibles dans le canvas).
 _TEMPLATE_META = {"width": 480, "height": 832, "fps": 30.0, "frames": 120}
-_TEMPLATE_FILES = {"control": "control.mp4", "mask": "mask.mp4", "ref": "ref.png"}
+_TEMPLATE_FILES = {"control": {"control": "control.mp4", "mask": "mask.mp4", "ref": "ref.png"},
+                   "pose": {"source": "source.mp4", "mask": "mask.mp4", "ref": "ref.png"}}
+
+
+def _pop_signal(args):
+    """Retire `--signal X` de args (defaut : control)."""
+    if "--signal" in args:
+        i = args.index("--signal")
+        sig = args[i + 1] if i + 1 < len(args) else ""
+        del args[i:i + 2]
+        signal_of({"signal": sig})
+        return sig
+    return "control"
+
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 5 and sys.argv[1] == "--validate":
-        _validate(sys.argv[2], sys.argv[3], sys.argv[4])
+    args = sys.argv[1:]
+    signal = _pop_signal(args)
+    if len(args) >= 3 and args[0] == "--validate":
+        _validate(args[1], signal, args[2:])
         sys.exit(0)
-    if len(sys.argv) >= 2 and sys.argv[1] == "--dump-api":
+    if args and args[0] == "--dump-api":
         # graphe FORMAT API seul (sans la ligne plan), pour le convertisseur API->UI.
-        params = json.load(open(sys.argv[2])) if len(sys.argv) > 2 else {}
-        print(json.dumps(build_workflow(params, "", "", _TEMPLATE_FILES, "fakinflu/animation", _TEMPLATE_META), indent=1))
+        params = {"signal": signal, **(json.load(open(args[1])) if len(args) > 1 else {})}
+        files = _TEMPLATE_FILES[signal_of(params)]
+        print(json.dumps(build_workflow(params, "", "", files, "fakinflu/animation", _TEMPLATE_META), indent=1))
         sys.exit(0)
-    params = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else {}
+    params = {"signal": signal, **(json.load(open(args[0])) if args else {})}
+    files = _TEMPLATE_FILES[signal_of(params)]
     print(json.dumps(plan(params, _TEMPLATE_META)))
-    print(json.dumps(build_workflow(params, "prompt", "", _TEMPLATE_FILES, "fakinflu/run", _TEMPLATE_META), indent=1))
+    print(json.dumps(build_workflow(params, "prompt", "", files, "fakinflu/run", _TEMPLATE_META), indent=1))

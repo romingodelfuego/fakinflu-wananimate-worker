@@ -29,6 +29,25 @@ ENV COMFY_EXTRA_ARGS="--disable-pinned-memory"
 RUN apt-get update && apt-get install -y --no-install-recommends aria2 \
  && rm -rf /var/lib/apt/lists/*
 
+# --- Signal `pose` (v1.2.0) : squelette DWPose calcule dans le worker (comme Openjutsu) --------------
+# Pack comfyui_controlnet_aux epingle sur le commit teste par Openjutsu. Installe SANS toucher a torch,
+# numpy ni transformers/huggingface-hub (contraintes = versions de l'image de base) : un torch remplace
+# casserait CUDA, un huggingface-hub 1.x casserait ComfyUI au demarrage.
+ARG AUX_COMMIT=a587a4c1594524c1d2de5cd1a86cd868ff448e1c
+RUN git clone -q https://github.com/Fannovel16/comfyui_controlnet_aux /comfyui/custom_nodes/comfyui_controlnet_aux \
+ && git -C /comfyui/custom_nodes/comfyui_controlnet_aux checkout -q ${AUX_COMMIT} \
+ && pip freeze | grep -iE '^(torch|torchvision|torchaudio|numpy|transformers|huggingface-hub|huggingface_hub)==' > /tmp/pins.txt \
+ && cat /tmp/pins.txt \
+ && pip install --no-cache-dir -r /comfyui/custom_nodes/comfyui_controlnet_aux/requirements.txt -c /tmp/pins.txt \
+ && grep -rq '"DWPreprocessor"' /comfyui/custom_nodes/comfyui_controlnet_aux/
+
+# Poids DWPose BAKES (aucun telechargement au demarrage a froid) : chemin exact ou le pack les cherche
+# (custom_hf_download : <pack>/ckpts/<depot HF>/<fichier>, annotator_ckpts_path par defaut).
+COPY download_models.sh /tmp/download_models.sh
+RUN MODELS_DIR=/comfyui/custom_nodes/comfyui_controlnet_aux/ckpts bash /tmp/download_models.sh dwpose \
+ && test -s /comfyui/custom_nodes/comfyui_controlnet_aux/ckpts/hr16/yolox-onnx/yolox_l.torchscript.pt \
+ && test -s /comfyui/custom_nodes/comfyui_controlnet_aux/ckpts/hr16/DWPose-TorchScript-BatchSize5/dw-ll_ucoco_384_bs5.torchscript.pt
+
 # --- Poids BAKES : core ~10 Go + int8 ~17 Go (WITH_INT8) + bf16 ~33 Go (WITH_BF16) ------------------
 # int8 par defaut (modele resident en VRAM sur 48 Go) ; bf16 en option (plus fidele, plus lourd).
 ARG WITH_INT8=1
